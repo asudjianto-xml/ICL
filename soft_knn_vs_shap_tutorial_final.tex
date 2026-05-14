@@ -1,0 +1,565 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{natbib}
+\usepackage{mathtools}
+\usepackage{float}
+\usepackage{caption}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  citecolor=blue!60!black,
+  urlcolor=blue!60!black
+}
+
+\newtheorem{definition}{Definition}
+\newtheorem{proposition}{Proposition}
+\newtheorem{remark}{Remark}
+\newtheorem{example}{Example}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\1}{\mathbf{1}}
+\newcommand{\softmax}{\operatorname{softmax}}
+\newcommand{\argmin}{\operatorname*{arg\,min}}
+\newcommand{\neff}{N_{\mathrm{eff}}}
+\newcommand{\diag}{\operatorname{diag}}
+\newcommand{\KL}{D_{\mathrm{KL}}}
+\newcommand{\SHAP}{\operatorname{SHAP}}
+\newcommand{\Var}{\operatorname{Var}}
+\newcommand{\Cov}{\operatorname{Cov}}
+
+\title{Soft Nearest-Neighbor Explanations versus SHAP:\\
+A Tutorial on What Feature Attribution Misses in Local Empirical-Measure Models}
+\author{Agus Sudjianto\\
+\small H2O.ai\\
+\small Center for Trustworthy AI Through Model Risk Management, University of North Carolina Charlotte}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Soft nearest-neighbor regression is one of the simplest models in which prediction is produced by a local empirical measure over training examples. For a query point $x_0$, the model assigns weights to training rows according to distance and predicts by averaging their labels. Because the full prediction mechanism is explicit, soft kNN is an ideal tutorial model for studying the difference between two forms of local explanation. SHAP explains how query features contribute to the prediction relative to a background distribution. A soft-kNN explanation explains which training examples received weight, why those examples were close and whether their labels agree. Both are valid, but they answer different questions. This paper uses explicit soft kNN to show the distinction. We derive the exact neighbor-weight explanation, define feature-level neighborhood-formation and outcome-contrast scores, then compare them to SHAP in four executed simulation demonstrations. The results show that SHAP can be useful as an outer feature-attribution summary but can obscure four mechanisms central to neighborhood models: neighbor identity, neighborhood switching, local density and label disagreement. The accompanying notebook implements all examples and produces the figures and tables in this paper.
+\end{abstract}
+
+\noindent\textbf{Companion notebook:} \url{https://github.com/asudjianto-xml/ICL/blob/main/soft_knn_vs_shap_companion_notebook_executed.ipynb}
+
+\noindent\textbf{Keywords:} soft kNN; SHAP; feature attribution; example-based explanation; local empirical-measure models; model interpretability; context influence.
+
+\section{Introduction}
+
+Feature attribution has become the default language of model explainability. A local explanation is often expected to answer the question: which features increased or decreased this prediction? SHAP is the most widely used representative of this family. It decomposes a prediction into additive contributions of the query features relative to a background distribution \citep{shapley1953value,lundberg2017unified}. Related feature-attribution methods such as integrated gradients provide alternative axiomatic decompositions for differentiable models \citep{sundararajan2017axiomatic}.
+
+For many models, however, this is not the most natural explanatory object. In nearest-neighbor and kernel-smoothing models, a prediction is not produced by feature effects directly. It is produced by retrieving nearby training cases, weighting them and averaging their labels. The immediate cause of the prediction is therefore a local empirical measure over training examples.
+
+Soft kNN makes this distinction transparent. Given training data
+\[
+\mathcal D=\{(x_i,y_i)\}_{i=1}^n, \qquad x_i\in\R^p,\quad y_i\in\R,
+\]
+a query point $x_0$ is predicted by
+\[
+\hat y(x_0)=\sum_{i=1}^n w_i(x_0)y_i,
+\]
+where $w_i(x_0)$ is a normalized similarity weight. The direct explanation is not first a vector of feature attributions. The direct explanation is the weighted neighborhood
+\[
+\{(x_i,y_i,w_i(x_0),d(x_0,x_i))\}_{i=1}^n.
+\]
+This object says which training cases supported the prediction, how much weight they received and whether their labels were consistent.
+
+This tutorial compares two explanation modes:
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{SHAP explanation}: explains the outer prediction map $x_0\mapsto \hat y(x_0)$ by additive feature contributions.
+    \item \textbf{Soft-kNN explanation}: explains the inner empirical-measure mechanism $x_0\mapsto w(x_0)\mapsto \hat y(x_0)$ by case weights, distance decomposition and local label agreement.
+\end{enumerate}
+
+The purpose is not to argue that SHAP is wrong. SHAP answers a legitimate question. The purpose is to show that, for neighborhood models, SHAP is incomplete and can be misleading if used as the sole explanation.
+
+The tutorial is also intended as a transparent bridge between classical soft nearest-neighbor models and explanation methods for context-conditioned tabular systems. In explicit soft kNN, the local weights are known. In tabular in-context learning and other implicit retrieval-style models, analogous weights must be estimated. The explicit case is therefore the clean laboratory where the distinction between outer feature attribution and inner evidence attribution can be seen without architectural complications.
+
+\section{Related work}
+
+\paragraph{Feature attribution.} SHAP derives additive local explanations from Shapley values and provides a model-agnostic framework for assigning prediction differences to input features \citep{shapley1953value,lundberg2017unified}. Integrated gradients gives an alternative axiomatic attribution method for differentiable models \citep{sundararajan2017axiomatic}. These methods explain the outer function from features to prediction. Our focus is different: in a soft nearest-neighbor model, the prediction is mediated by a visible empirical measure over training rows. This makes it possible to compare feature attribution against the actual row-weight mechanism.
+
+\paragraph{Limits of feature attribution.} Recent theoretical work has shown that complete and linear feature-attribution methods, including SHAP-style and integrated-gradient-style methods, can fail for certain end tasks unless the explanation target is specified carefully \citep{bilodeau2024impossibility}. This paper takes that warning literally. We define a different target for neighborhood models: the local empirical measure $w(x_0)$ and the evidence it places on training labels.
+
+\paragraph{Training-point and example-based explanation.} Influence functions trace predictions back to training points by approximating the effect of upweighting a training example through the fitted parameters \citep{koh2017understanding}. Soft kNN is simpler: no retraining path is needed because the training labels enter the prediction directly. Prototype and case-based explanation methods also explain predictions through examples rather than only through features \citep{li2018deep,chen2019looks}. Our setting is more elementary and more transparent: the examples are not learned prototypes or image parts, but the actual weighted neighbors used by the soft-kNN predictor.
+
+\paragraph{kNN-local interpretation.} Kaneko proposes local interpretation for nonlinear regression using k-nearest neighbors around a target sample, including comparisons with LIME and SHAP-style explanations \citep{kaneko2023local}. That work uses kNN as a local approximator around a target point to stabilize interpretation of another nonlinear model. Here kNN is the model itself, so the weight vector is exact rather than approximate. The present tutorial therefore asks a sharper mechanistic question: when the predictor itself is soft kNN, what does SHAP miss relative to the exact neighbor-weight explanation?
+
+\paragraph{Attention and attribution.} The debate over whether attention weights are explanations is relevant by analogy \citep{jain2019attention,wiegreffe2019attention}. In many neural models, attention weights are not automatically faithful causal explanations. In explicit soft kNN, however, the weights are not merely internal attention-like quantities. They are exactly the derivatives of the prediction with respect to training labels. This makes soft kNN a useful laboratory for separating genuine evidence weights from generic feature attribution.
+
+\section{Soft kNN model}
+
+Let $d_M$ be a weighted Euclidean distance,
+\begin{equation}
+ d_M^2(x_0,x_i)=\sum_{j=1}^p \lambda_j(x_{0j}-x_{ij})^2,
+ \qquad \lambda_j\ge 0.
+ \label{eq:weighted_distance}
+\end{equation}
+The soft nearest-neighbor weights are
+\begin{equation}
+ w_i(x_0)=\frac{\exp\{-d_M^2(x_0,x_i)/(2\tau^2)\}}
+ {\sum_{r=1}^n \exp\{-d_M^2(x_0,x_r)/(2\tau^2)\}},
+ \label{eq:soft_weight}
+\end{equation}
+where $\tau>0$ is the bandwidth or temperature. The prediction is
+\begin{equation}
+ \hat y(x_0)=\sum_{i=1}^n w_i(x_0)y_i.
+ \label{eq:soft_prediction}
+\end{equation}
+
+Small $\tau$ produces nearly hard nearest-neighbor behavior. Large $\tau$ produces a diffuse average. The model is a normalized kernel smoother, equivalent to a Gaussian Nadaraya-Watson estimator under the metric $M=\diag(\lambda_1,\ldots,\lambda_p)$ \citep{nadaraya1964estimating,watson1964smooth}.
+
+\begin{proposition}[Exact label influence]
+For the soft kNN model in \eqref{eq:soft_prediction}, where $w_i(x_0)$ depends on $x_0$ and $X$ but not on $y$, the derivative of the prediction with respect to training label $y_i$ is
+\[
+\frac{\partial \hat y(x_0)}{\partial y_i}=w_i(x_0).
+\]
+\end{proposition}
+
+\begin{proof}
+Holding $x_0$ and $X$ fixed,
+\[
+\hat y(x_0)=\sum_{r=1}^n w_r(x_0)y_r.
+\]
+Differentiating with respect to $y_i$ gives $w_i(x_0)$.
+\end{proof}
+
+This proposition is central. In soft kNN, the row-level influence explanation is exact and visible: it is the neighbor-weight vector. This differs from classical influence functions, where training-point influence is mediated by a fitted parameter and a retraining or upweighting counterfactual \citep{koh2017understanding}.
+
+\section{What SHAP explains}
+
+SHAP explains a prediction by additive feature contributions \citep{lundberg2017unified}. For a model $f$ and a query point $x_0$, a SHAP explanation has the form
+\begin{equation}
+ f(x_0)=\phi_0+\sum_{j=1}^p \phi_j(x_0),
+ \label{eq:shap_decomp}
+\end{equation}
+where $\phi_0$ is a baseline and $\phi_j(x_0)$ is the contribution assigned to feature $j$. Model-agnostic SHAP computes these values by averaging marginal changes in prediction over coalitions of observed and missing features.
+
+For soft kNN, SHAP therefore explains the composed map
+\[
+x_0 \longmapsto w(x_0) \longmapsto \hat y(x_0).
+\]
+It does not directly explain the intermediate weight vector $w(x_0)$. This is the root of the difference.
+
+\begin{remark}[Outer versus inner explanation]
+SHAP explains the outer function $x_0\mapsto \hat y(x_0)$. Soft-kNN explanation explains the inner mechanism $x_0\mapsto w(x_0)$ and then $w(x_0)\mapsto \hat y(x_0)$. For a neighborhood model, the inner mechanism is often the more faithful explanation.
+\end{remark}
+
+\section{The soft-kNN explanation object}
+
+For a query $x_0$, define the explanation object
+\begin{equation}
+\mathcal E_{\mathrm{kNN}}(x_0)=
+\left[
+\hat y(x_0),
+\{i,x_i,y_i,w_i,d_i\}_{i\in \mathrm{TopK}},
+\neff(x_0),
+H(x_0),
+\Delta_y(x_0),
+\Delta_x(x_0)
+\right].
+\label{eq:knn_explanation_object}
+\end{equation}
+Here $d_i=d_M(x_0,x_i)$ and the top-$K$ rows are selected by largest $w_i$.
+
+The effective number of neighbors is
+\begin{equation}
+\neff(x_0)=\frac{1}{\sum_{i=1}^n w_i(x_0)^2}.
+\label{eq:neff}
+\end{equation}
+If $\neff\approx 1$, the model is nearly memorizing a single nearest row. If $\neff$ is large, the model is averaging broadly. Define also the local label dispersion
+\begin{equation}
+\Delta_y(x_0)=\sum_i w_i(x_0)(y_i-\hat y(x_0))^2
+\label{eq:local_label_dispersion}
+\end{equation}
+and the local geometric radius
+\begin{equation}
+\Delta_x(x_0)=\sum_i w_i(x_0)d_M^2(x_0,x_i).
+\label{eq:local_radius}
+\end{equation}
+$\Delta_y$ measures whether influential neighbors agree. $\Delta_x$ measures whether the query is supported by nearby data.
+
+\section{Feature explanation inside soft kNN}
+
+Soft kNN has feature explanations, but they are not the same as SHAP values. Feature explanation should be separated into two questions.
+
+Feature $j$ contributes to the distance from $x_0$ to $x_i$ by
+\begin{equation}
+ c_{ij}(x_0)=\lambda_j(x_{0j}-x_{ij})^2.
+\end{equation}
+The share of distance explained by feature $j$ for neighbor $i$ is
+\begin{equation}
+ r_{ij}(x_0)=\frac{c_{ij}(x_0)}{\sum_{\ell=1}^p c_{i\ell}(x_0)+\eta}.
+ \label{eq:distance_share}
+\end{equation}
+Aggregating over the soft neighborhood gives the neighborhood-formation score
+\begin{equation}
+ R_j(x_0)=\sum_i w_i(x_0)r_{ij}(x_0).
+ \label{eq:Rj}
+\end{equation}
+This answers: which features explain why the influential neighbors are close to the query? The score satisfies $R_j\ge 0$ and $\sum_jR_j\approx 1$.
+
+A feature may define the local neighborhood without explaining why the prediction is high or low. To connect feature geometry to labels, define the signed outcome-contrast score
+\begin{equation}
+ A_j(x_0)=\sum_i w_i(x_0)(y_i-\hat y(x_0))r_{ij}(x_0).
+ \label{eq:Aj}
+\end{equation}
+$A_j$ can be positive, negative or near zero and has the scale of $y$. We use the standardized version
+\begin{equation}
+ A_j^{\mathrm{std}}(x_0)=\frac{A_j(x_0)}{\sqrt{\Delta_y(x_0)}+\eta}
+ \label{eq:Aj_standardized}
+\end{equation}
+and the unsigned heterogeneity score
+\begin{equation}
+ B_j(x_0)=\sum_i w_i(x_0)|y_i-\hat y(x_0)|r_{ij}(x_0).
+ \label{eq:Bj}
+\end{equation}
+$R_j$ is a geometry score. $A_j^{\mathrm{std}}$ is a signed local outcome-contrast score. $B_j$ is an unsigned local outcome-heterogeneity score. SHAP often compresses these mechanisms into one number.
+
+\section{The key comparison}
+
+Table \ref{tab:comparison} summarizes the difference.
+
+\begin{table}[H]
+\centering
+\caption{SHAP versus soft-kNN explanation.}
+\label{tab:comparison}
+\begin{tabular}{lll}
+\toprule
+Question & SHAP & Soft-kNN explanation \\
+\midrule
+What is explained? & Feature contribution to $\hat y(x_0)$ & Local empirical measure \\
+Unit of explanation & Feature & Training row plus feature channel \\
+Mechanism exposed? & Indirectly & Directly \\
+Shows neighbor identity? & No & Yes \\
+Shows label agreement? & No & Yes \\
+Shows local density? & No & Yes \\
+Shows neighborhood instability? & Not directly & Yes \\
+Best use & Outer feature summary & Mechanistic local evidence \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The compact statement is
+\[
+\text{SHAP explains } x_0\mapsto \hat y(x_0),
+\qquad
+\text{soft kNN explains } x_0\mapsto w(x_0)\mapsto \hat y(x_0).
+\]
+
+\section{Four pitfalls of using SHAP alone}
+
+\paragraph{Pitfall 1: SHAP hides neighbor identity.} A SHAP explanation may say that feature 1 contributed $+0.35$ and feature 2 contributed $-0.10$. This is useful, but it does not tell us whether the prediction came from one close row, ten moderately close rows or a mixture of high and low labels that average to the same value. Soft kNN distinguishes these cases by reporting $(i,y_i,w_i,d_i)$.
+
+\paragraph{Pitfall 2: SHAP can confuse feature effect with neighbor switching.} In a neighborhood model, changing a query feature can change the prediction because it changes which rows are retrieved. Consider one feature $x$ and two training points $(x_1,y_1)=(0,0)$ and $(x_2,y_2)=(1,1)$. The soft-kNN prediction is
+\[
+\hat y(x)=\frac{\exp\{-(x-1)^2/(2\tau^2)\}}{\exp\{-x^2/(2\tau^2)\}+\exp\{-(x-1)^2/(2\tau^2)\}}.
+\]
+As $x$ moves from 0 to 1, the prediction rises from near 0 to near 1. SHAP attributes this change to $x$. That is not wrong, but the mechanism is not a structural linear effect. Let $w_2(x)=\hat y(x)$ and $w_1(x)=1-w_2(x)$. Then
+\[
+\frac{d\hat y(x)}{dx}=\frac{dw_2(x)}{dx}(y_2-y_1).
+\]
+The feature effect is entirely mediated by a change in neighbor weights.
+
+\paragraph{Pitfall 3: SHAP can miss local density and extrapolation risk.} A soft-kNN prediction can be unstable when the query lies far from the training data. SHAP values can still be produced, but they do not automatically reveal poor local support. $\Delta_x$ reports how far the effective neighborhood lies from the query and $w_{\max}=\max_i w_i$ reports whether the prediction is dominated by a single row.
+
+\paragraph{Pitfall 4: SHAP can hide label disagreement.} A neighborhood model can make a plausible prediction even when nearby labels disagree. For regression, disagreement is measured by $\Delta_y$. For classification, local class probabilities $p_c^{\mathrm{loc}}(x_0)=\sum_i w_i(x_0)\1(y_i=c)$ give a local margin. SHAP may show which features drove the prediction, but it does not naturally report whether the local evidence was internally consistent.
+
+\section{Simulation demonstrations}
+
+The companion notebook executes four fully specified demonstrations. All use explicit soft kNN. Features are standardized before computing distance and $\lambda_j=1$. To avoid an external package dependency, the notebook computes exact interventional Shapley values for the low-dimensional examples by enumerating feature coalitions and averaging missing features over the empirical background distribution.
+
+\subsection{Demonstration 1: smooth one-dimensional regression}
+
+Generate
+\[
+x_i\sim \mathrm{Unif}(0,1),
+\qquad
+ y_i=\sin(2\pi x_i)+0.10\epsilon_i,
+\qquad
+\epsilon_i\sim N(0,1),
+\]
+with $n=200$ and bandwidth $\tau=0.20$ after standardization. Table \ref{tab:demo1} reports five query points. Figure \ref{fig:demo1} shows the local evidence for $x_0=0.25$.
+
+\begin{table}[H]
+\centering
+\caption{Demonstration 1: smooth regression. The soft-kNN evidence layer reports concentration and local agreement in addition to the one-dimensional SHAP value.}
+\label{tab:demo1}
+\input{tables/demo1_table.tex}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=.48\textwidth]{figures/demo1_distance_label.png}\hfill
+\includegraphics[width=.48\textwidth]{figures/demo1_top_weights.png}
+\caption{Demonstration 1: distance-label plot and top-neighbor weights for $x_0=0.25$. In a smooth region, the neighbor explanation and SHAP are not in conflict, but the neighbor explanation adds the evidence layer.}
+\label{fig:demo1}
+\end{figure}
+
+\paragraph{Interpretation.} In one dimension, the feature-geometry score $R_1$ is necessarily one. The useful information is therefore not feature ranking. It is the evidence layer: top weighted rows, $\neff$, $\Delta_y$, $\Delta_x$ and $w_{\max}$. The prediction at $x_0=0.25$ is supported by a broad local neighborhood with small label dispersion.
+
+\subsection{Demonstration 2: same prediction, different local evidence}
+
+This example constructs two query regions with nearly the same prediction but very different local label dispersion. Around $x=0.25$, labels are smooth: $y_i=0.5+0.05\epsilon_i$. Around $x=0.75$, labels are conflicting: $y_i=0.5+s_i+0.05\epsilon_i$, where $s_i\in\{-0.4,+0.4\}$ with equal probability. Table \ref{tab:demo2} and Figure \ref{fig:demo2} show the result.
+
+\begin{table}[H]
+\centering
+\caption{Demonstration 2: two queries with nearly identical predictions and nearly identical SHAP values, but very different local label dispersion.}
+\label{tab:demo2}
+\input{tables/demo2_table.tex}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=.48\textwidth]{figures/demo2_A_distance_label.png}\hfill
+\includegraphics[width=.48\textwidth]{figures/demo2_B_distance_label.png}
+\caption{Demonstration 2: local consensus versus local conflict. The two predictions are similar, but $\Delta_y$ reveals that the second prediction is an average over conflicting evidence.}
+\label{fig:demo2}
+\end{figure}
+
+\paragraph{Interpretation.} The two predictions are $0.504$ and $0.513$ and the SHAP values are close to zero in both cases. SHAP therefore sees almost no difference. The soft-kNN explanation sees a major difference: $\Delta_y$ increases from $0.006$ to $0.154$. The first query is locally coherent. The second is an accidental average over disagreement.
+
+\subsection{Demonstration 3: neighbor-switching boundary}
+
+Generate two clusters in two dimensions:
+\[
+X_A\sim N((-1,0),0.15^2I),\qquad y_A=0,
+\]
+\[
+X_B\sim N((1,0),0.15^2I),\qquad y_B=1.
+\]
+Evaluate query points along $x_0(t)=(t,0)$. Figure \ref{fig:demo3curves} shows that the prediction is effectively the soft mass assigned to the right cluster. Table \ref{tab:demo3} reports the boundary query.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=.48\textwidth]{figures/demo3_switching_curve.png}\hfill
+\includegraphics[width=.48\textwidth]{figures/demo3_shap_curve.png}
+\caption{Demonstration 3: as the query moves from the left cluster to the right cluster, the prediction changes by transferring soft-neighbor mass from one witness set to the other. SHAP assigns this change to $x_1$, but the mechanism is neighbor switching.}
+\label{fig:demo3curves}
+\end{figure}
+
+\begin{table}[H]
+\centering
+\caption{Demonstration 3: boundary query at $(0,0)$.}
+\label{tab:demo3}
+\input{tables/demo3_boundary_table.tex}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=.48\textwidth]{figures/demo3_boundary_distance_label.png}\hfill
+\includegraphics[width=.48\textwidth]{figures/demo3_shap_vs_scores.png}
+\caption{Demonstration 3: at the boundary, local evidence is mixed. The distance-label plot shows that the prediction is formed by mixing left-cluster and right-cluster labels, while the feature-score chart separates SHAP from the mechanism scores $R_j$, $A_j^{\mathrm{std}}$ and $B_j$.}
+\label{fig:demo3boundary}
+\end{figure}
+
+\paragraph{Interpretation.} Along the transition path, the SHAP curve assigns the dominant change to $x_1$. The soft-kNN explanation gives the sharper statement: $x_1$ matters because it moves the query from one weighted witness set to another. At the boundary query itself, the two-feature feature-score chart is a cautionary case: SHAP and the mechanism scores need not rank features the same way. The explanation is not ``feature $x_1$ has a structural positive effect.'' The explanation is ``feature $x_1$ changes the neighbor weights.''
+
+\subsection{Demonstration 4: density-mediated feature effect}
+
+This example separates structural response effect from neighborhood-selection effect. The response is
+\[
+y=x_1+0.10\epsilon.
+\]
+The second feature is generated by
+\[
+x_2\mid x_1\sim N(2\1\{x_1>0\},0.20^2).
+\]
+Thus $x_2$ is not structurally in the response function, but it affects the data manifold and therefore the soft-kNN neighborhood. Figure \ref{fig:demo4manifold} shows the geometry. Table \ref{tab:demo4} compares an on-manifold query and an off-manifold query with the same $x_1$.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=.62\textwidth]{figures/demo4_manifold.png}
+\caption{Demonstration 4: the response depends structurally on $x_1$, but $x_2$ organizes the sampling manifold. A query with the same $x_1$ but an off-manifold $x_2$ retrieves a different local evidence set.}
+\label{fig:demo4manifold}
+\end{figure}
+
+\begin{table}[H]
+\centering
+\caption{Demonstration 4: on-manifold versus off-manifold query. The off-manifold query has a larger local radius and a strong SHAP contribution for $x_2$, even though $x_2$ is not a structural response feature.}
+\label{tab:demo4}
+\input{tables/demo4_table.tex}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=.48\textwidth]{figures/demo4_on_distance_label.png}\hfill
+\includegraphics[width=.48\textwidth]{figures/demo4_off_distance_label.png}
+\caption{Demonstration 4: on-manifold versus off-manifold evidence. The off-manifold query has weaker and more distant local support.}
+\label{fig:demo4evidence}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=.70\textwidth]{figures/demo4_off_shap_vs_scores.png}
+\caption{Demonstration 4: for the off-manifold query, SHAP assigns substantial magnitude to $x_2$. The soft-kNN scores clarify that this is a neighborhood-selection and density effect rather than a direct structural response effect.}
+\label{fig:demo4scores}
+\end{figure}
+
+\paragraph{Interpretation.} The on-manifold query predicts $0.312$, while the off-manifold query with the same $x_1$ predicts $-0.085$. SHAP assigns a large contribution to $x_2$ in both directions. The soft-kNN diagnostics explain why: changing $x_2$ changes the neighborhood. The off-manifold query has much larger $\Delta_x$ and a more concentrated weight distribution. The feature is not a direct response feature, but it is a density and retrieval feature.
+
+\section{Concrete comparison criteria}
+
+The comparison should not ask whether SHAP and soft-kNN explanations are numerically equal. They estimate different objects. The useful question is whether a SHAP feature attribution can be decomposed into recognizable neighborhood mechanisms.
+
+For each query, compute
+\begin{align}
+\rho_{\mathrm{geom}}(x_0) &= \operatorname{Spearman}(|\phi_j|, R_j), \\
+\rho_{\mathrm{contrast}}(x_0) &= \operatorname{Spearman}(|\phi_j|, |A_j^{\mathrm{std}}|), \\
+\rho_{\mathrm{hetero}}(x_0) &= \operatorname{Spearman}(|\phi_j|, B_j).
+\end{align}
+Then interpret:
+\begin{itemize}[leftmargin=*]
+    \item High $\rho_{\mathrm{geom}}$: SHAP is largely tracking neighborhood formation.
+    \item High $\rho_{\mathrm{contrast}}$: SHAP is aligned with signed local outcome contrast.
+    \item High $\rho_{\mathrm{hetero}}$: SHAP is aligned with local label heterogeneity.
+    \item Low values for all three: SHAP is likely dominated by the background distribution or by a nonlocal perturbation path.
+\end{itemize}
+
+Also compute top-$m$ overlap:
+\[
+O_m(S,T)=\frac{|\operatorname{Top}m(S)\cap\operatorname{Top}m(T)|}{m}.
+\]
+This gives a practitioner-readable comparison between top SHAP features and top soft-kNN mechanism features.
+
+For the executed two-feature demonstrations, Spearman correlations are degenerate: with only two features they reduce to $+1$ or $-1$ when the rankings agree or reverse, and they should not be read as stable effect-size estimates. They are still useful as directional diagnostics. Table \ref{tab:comparison_criteria} reports the values for the two multi-feature demonstrations. In the boundary and density examples, $|\phi_j|$ is anti-aligned with the neighborhood-formation score $R_j$ and the unsigned local heterogeneity score $B_j$. This is exactly the paper's point: a feature can receive a large SHAP value because of the outer perturbation path even when a different feature controls the actual local evidence geometry.
+
+\begin{table}[H]
+\centering
+\caption{Comparison criteria for the two-feature demonstrations. Because $p=2$, Spearman values are directional indicators rather than robust correlation estimates.}
+\label{tab:comparison_criteria}
+\input{tables/comparison_criteria_table.tex}
+\end{table}
+
+\section{Recommended explanation workflow}
+
+For each query $x_0$, compute both SHAP and soft-kNN explanations, but use them for different purposes.
+
+\begin{algorithm}[H]
+\caption{Transparent soft-kNN explanation workflow}
+\begin{algorithmic}[1]
+\REQUIRE Training data $\mathcal D$, query $x_0$, bandwidth $\tau$, metric weights $\lambda$
+\STATE Compute distances $d_M(x_0,x_i)$
+\STATE Compute soft weights $w_i(x_0)$
+\STATE Compute prediction $\hat y(x_0)=\sum_i w_i y_i$
+\STATE Report top weighted rows $(i,x_i,y_i,w_i,d_i)$
+\STATE Compute $\neff$, entropy $H$, local label dispersion $\Delta_y$ and radius $\Delta_x$
+\STATE Compute feature geometry scores $R_j$, signed outcome-contrast scores $A_j^{\mathrm{std}}$ and unsigned heterogeneity scores $B_j$
+\STATE Compute SHAP values $\phi_j(x_0)$ for the outer prediction function
+\STATE Compare $|\phi_j|$ to $R_j$, $|A_j^{\mathrm{std}}|$ and $B_j$ using rank correlations and top-$m$ overlaps
+\STATE Render the explanation using the visualization template: prediction diagnostics, top-neighbor ledger, distance-label plot, feature heatmap and SHAP versus soft-kNN score chart
+\end{algorithmic}
+\end{algorithm}
+
+The key comparison is not whether SHAP and soft-kNN explanations agree. The useful question is: when SHAP assigns importance to a feature, is that importance due to neighborhood formation, local outcome contrast, neighbor switching, local heterogeneity or global background effects?
+
+\section{What this tutorial does not cover}
+
+This paper deliberately focuses on explicit soft kNN. It does not develop the full machinery for implicit soft kNN or tabular in-context learners. In such models, the neighbor weights are hidden and must be estimated by label perturbation, row deletion, gradients or subset reconstruction. That problem is connected to the broader literature on in-context learning as implicit inference or implicit optimization \citep{xie2022explanation,vonOswald2023transformers} and to training-point influence methods that trace predictions back to influential data \citep{koh2017understanding}. A full treatment of label-perturbation and leave-one-out influence for in-context learners deserves a separate paper.
+
+The only connection needed here is conceptual. Explicit soft kNN teaches the distinction between outer feature attribution and inner context-evidence explanation. Once that distinction is clear, the implicit case can be approached by replacing the known weights $w_i(x_0)$ with estimated context influence weights.
+
+\section{Conclusion}
+
+Soft kNN is a useful teaching model because its prediction mechanism is completely visible. The prediction is a weighted average of observed labels and the weights are the exact local label influences. This makes it possible to compare SHAP against the true neighborhood mechanism without ambiguity.
+
+The comparison shows that SHAP is useful but incomplete. SHAP tells us which query features contribute to the prediction relative to a background distribution. Soft-kNN explanation tells us which cases influenced the prediction, why they were selected, whether their labels agree, how concentrated the local evidence is and whether the prediction is locally supported or fragile.
+
+For neighborhood and context-conditioned models, the most faithful local explanation is therefore not only a feature-attribution vector. It is a local empirical-measure explanation:
+\[
+x_0 \rightarrow w(x_0) \rightarrow \hat y(x_0).
+\]
+SHAP can be added as an outer feature summary, but it should not replace the neighbor-weight explanation.
+
+\begin{thebibliography}{99}
+
+\bibitem[Shapley(1953)]{shapley1953value}
+Shapley, L. S. (1953).
+\newblock A value for n-person games.
+\newblock In H. W. Kuhn and A. W. Tucker (Eds.), \emph{Contributions to the Theory of Games II}, pages 307--317. Princeton University Press.
+
+\bibitem[Nadaraya(1964)]{nadaraya1964estimating}
+Nadaraya, E. A. (1964).
+\newblock On estimating regression.
+\newblock \emph{Theory of Probability and Its Applications}, 9(1), 141--142.
+\newblock doi:10.1137/1109020.
+
+\bibitem[Watson(1964)]{watson1964smooth}
+Watson, G. S. (1964).
+\newblock Smooth regression analysis.
+\newblock \emph{Sankhya: The Indian Journal of Statistics, Series A}, 26(4), 359--372.
+
+\bibitem[Lundberg and Lee(2017)]{lundberg2017unified}
+Lundberg, S. M. and Lee, S.-I. (2017).
+\newblock A unified approach to interpreting model predictions.
+\newblock In \emph{Advances in Neural Information Processing Systems}, 30.
+
+\bibitem[Sundararajan et al.(2017)]{sundararajan2017axiomatic}
+Sundararajan, M., Taly, A. and Yan, Q. (2017).
+\newblock Axiomatic attribution for deep networks.
+\newblock In \emph{Proceedings of the 34th International Conference on Machine Learning}, PMLR 70, pages 3319--3328.
+
+\bibitem[Koh and Liang(2017)]{koh2017understanding}
+Koh, P. W. and Liang, P. (2017).
+\newblock Understanding black-box predictions via influence functions.
+\newblock In \emph{Proceedings of the 34th International Conference on Machine Learning}, PMLR 70, pages 1885--1894.
+
+\bibitem[Kaneko(2023)]{kaneko2023local}
+Kaneko, H. (2023).
+\newblock Local interpretation of nonlinear regression model with k-nearest neighbors.
+\newblock \emph{Digital Chemical Engineering}, 6, 100078.
+\newblock doi:10.1016/j.dche.2022.100078.
+
+\bibitem[Li et al.(2018)]{li2018deep}
+Li, O., Liu, H., Chen, C. and Rudin, C. (2018).
+\newblock Deep learning for case-based reasoning through prototypes: A neural network that explains its predictions.
+\newblock In \emph{Proceedings of the AAAI Conference on Artificial Intelligence}, pages 3530--3537.
+
+\bibitem[Chen et al.(2019)]{chen2019looks}
+Chen, C., Li, O., Tao, D., Barnett, A., Rudin, C. and Su, J. K. (2019).
+\newblock This looks like that: Deep learning for interpretable image recognition.
+\newblock In \emph{Advances in Neural Information Processing Systems}, 32.
+
+\bibitem[Jain and Wallace(2019)]{jain2019attention}
+Jain, S. and Wallace, B. C. (2019).
+\newblock Attention is not explanation.
+\newblock In \emph{Proceedings of the 2019 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies}, pages 3543--3556.
+\newblock doi:10.18653/v1/N19-1357.
+
+\bibitem[Wiegreffe and Pinter(2019)]{wiegreffe2019attention}
+Wiegreffe, S. and Pinter, Y. (2019).
+\newblock Attention is not not explanation.
+\newblock In \emph{Proceedings of the 2019 Conference on Empirical Methods in Natural Language Processing and the 9th International Joint Conference on Natural Language Processing}, pages 11--20.
+\newblock doi:10.18653/v1/D19-1002.
+
+
+\bibitem[Xie et al.(2022)]{xie2022explanation}
+Xie, S. M., Raghunathan, A., Liang, P. and Ma, T. (2022).
+\newblock An explanation of in-context learning as implicit Bayesian inference.
+\newblock In \emph{International Conference on Learning Representations}.
+
+\bibitem[von Oswald et al.(2023)]{vonOswald2023transformers}
+von Oswald, J., Niklasson, E., Randazzo, E., Sacramento, J., Mordvintsev, A., Zhmoginov, A. and Vladymyrov, M. (2023).
+\newblock Transformers learn in-context by gradient descent.
+\newblock In \emph{Proceedings of the 40th International Conference on Machine Learning}, PMLR 202, pages 35151--35174.
+
+\bibitem[Bilodeau et al.(2024)]{bilodeau2024impossibility}
+Bilodeau, B., Jaques, N., Koh, P. W. and Kim, B. (2024).
+\newblock Impossibility theorems for feature attribution.
+\newblock \emph{Proceedings of the National Academy of Sciences}, 121(2), e2304406120.
+\newblock doi:10.1073/pnas.2304406120.
+
+\end{thebibliography}
+
+\end{document}
